@@ -7,7 +7,9 @@ Track weekly cohort momentum with a lightweight Zig CLI that writes to Postgres.
 - Record weekly momentum entries per cohort.
 - List entries with optional cohort filtering.
 - Summarize totals and averages for quick reporting.
+- Export entries to CSV for sharing or analysis.
 - Report week-over-week momentum trends with weighted scoring.
+- Flag cohorts with low scores or sharp drops.
 
 ## Tech Stack
 - Zig 0.15
@@ -61,6 +63,16 @@ zig build run -- summary --cohort "Spring 2026"
 zig build run -- trend --cohort "Spring 2026" --weeks 8
 ```
 
+### 9) Review momentum alerts
+```
+zig build run -- alerts --min-score 30 --drop-threshold -5
+```
+
+### 10) Export entries to CSV
+```
+zig build run -- export --cohort "Spring 2026" --out momentum.csv
+```
+
 ## Commands
 - `init-db`: Apply `sql/schema.sql` to the configured database.
 - `seed-db`: Apply `sql/seed.sql` to the configured database.
@@ -68,6 +80,8 @@ zig build run -- trend --cohort "Spring 2026" --weeks 8
 - `list`: List entries (optionally filtered by cohort).
 - `summary`: Aggregate totals and averages (optionally filtered by cohort).
 - `trend`: Show recent week-over-week changes and weighted momentum score.
+- `alerts`: Flag cohorts below a minimum momentum score or with sharp drops.
+- `export`: Write entries to CSV (`--out -` to print to stdout).
 
 ## Notes
 - The CLI expects `GS_DATABASE_URL` to be set. Use a local Postgres instance for development.

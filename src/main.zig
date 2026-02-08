@@ -12,6 +12,7 @@ const usage =
     \\\\  cohort-momentum-ledger summary [--cohort NAME]
     \\\\  cohort-momentum-ledger trend --cohort NAME [--weeks N]
     \\\\  cohort-momentum-ledger export [--cohort NAME] --out PATH
+    \\\\  cohort-momentum-ledger alerts [--min-score N] [--drop-threshold N]
     \\\\
     \\\\Environment:
     \\\\  GS_DATABASE_URL   Postgres connection string for the target database.
@@ -68,6 +69,12 @@ pub fn main() !void {
         try withConnection(allocator, struct {
             fn call(conn: *c.PGconn, alloc: std.mem.Allocator, opts: *const Options) !void {
                 try exportEntries(conn, alloc, opts);
+            }
+        }.call, &options);
+    } else if (std.mem.eql(u8, command, "alerts")) {
+        try withConnection(allocator, struct {
+            fn call(conn: *c.PGconn, alloc: std.mem.Allocator, opts: *const Options) !void {
+                try alertEntries(conn, alloc, opts);
             }
         }.call, &options);
     } else {
@@ -289,6 +296,46 @@ fn trendEntries(conn: *c.PGconn, allocator: std.mem.Allocator, opts: *const Opti
         "FROM ordered " ++
         "ORDER BY week_index DESC " ++
         "LIMIT $2;";
+
+    const result = c.PQexecParams(conn, sql, 2, null, &values, null, null, 0);
+    defer c.PQclear(result);
+    try ensureTuplesOk(conn, result);
+    try printRows(result, std.io.getStdOut().writer());
+}
+
+fn alertEntries(conn: *c.PGconn, allocator: std.mem.Allocator, opts: *const Options) !void {
+    const min_score = opts.get("min-score") orelse "30";
+    const drop_threshold = opts.get("drop-threshold") orelse "-5";
+
+    const min_score_z = try std.cstr.addNullByte(allocator, min_score);
+    const drop_threshold_z = try std.cstr.addNullByte(allocator, drop_threshold);
+
+    var values: [2][*c]const u8 = .{ min_score_z.ptr, drop_threshold_z.ptr };
+    const sql =
+        "WITH scored AS (" ++
+        "  SELECT cohort_name, week_index, attendance_count, submission_count, session_count, " ++
+        "    (attendance_count * 0.5 + submission_count * 0.35 + session_count * 0.15) AS momentum_score, " ++
+        "    LAG(attendance_count * 0.5 + submission_count * 0.35 + session_count * 0.15) " ++
+        "      OVER (PARTITION BY cohort_name ORDER BY week_index) AS prev_momentum " ++
+        "  FROM groupscholar_cohort_momentum.momentum_entries" ++
+        "), latest AS (" ++
+        "  SELECT DISTINCT ON (cohort_name) cohort_name, week_index, attendance_count, submission_count, " ++
+        "    session_count, momentum_score, prev_momentum " ++
+        "  FROM scored " ++
+        "  ORDER BY cohort_name, week_index DESC" ++
+        ") " ++
+        "SELECT cohort_name, week_index, attendance_count, submission_count, session_count, " ++
+        "  ROUND(momentum_score::numeric, 2) AS momentum_score, " ++
+        "  ROUND((momentum_score - COALESCE(prev_momentum, momentum_score))::numeric, 2) AS momentum_delta, " ++
+        "  CASE " ++
+        "    WHEN momentum_score < $1 THEN 'LOW_SCORE' " ++
+        "    WHEN (momentum_score - COALESCE(prev_momentum, momentum_score)) < $2 THEN 'DROP' " ++
+        "    ELSE 'OK' " ++
+        "  END AS alert " ++
+        "FROM latest " ++
+        "WHERE momentum_score < $1 " ++
+        "   OR (momentum_score - COALESCE(prev_momentum, momentum_score)) < $2 " ++
+        "ORDER BY momentum_score ASC;";
 
     const result = c.PQexecParams(conn, sql, 2, null, &values, null, null, 0);
     defer c.PQclear(result);
