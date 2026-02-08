@@ -10,6 +10,8 @@ const usage =
     \\\\  cohort-momentum-ledger add --cohort NAME --week N --attendance N --submissions N --sessions N [--notes TEXT]
     \\\\  cohort-momentum-ledger list [--cohort NAME]
     \\\\  cohort-momentum-ledger summary [--cohort NAME]
+    \\\\  cohort-momentum-ledger trend --cohort NAME [--weeks N]
+    \\\\  cohort-momentum-ledger export [--cohort NAME] --out PATH
     \\\\
     \\\\Environment:
     \\\\  GS_DATABASE_URL   Postgres connection string for the target database.
@@ -54,6 +56,18 @@ pub fn main() !void {
         try withConnection(allocator, struct {
             fn call(conn: *c.PGconn, alloc: std.mem.Allocator, opts: *const Options) !void {
                 try summaryEntries(conn, alloc, opts);
+            }
+        }.call, &options);
+    } else if (std.mem.eql(u8, command, "trend")) {
+        try withConnection(allocator, struct {
+            fn call(conn: *c.PGconn, alloc: std.mem.Allocator, opts: *const Options) !void {
+                try trendEntries(conn, alloc, opts);
+            }
+        }.call, &options);
+    } else if (std.mem.eql(u8, command, "export")) {
+        try withConnection(allocator, struct {
+            fn call(conn: *c.PGconn, alloc: std.mem.Allocator, opts: *const Options) !void {
+                try exportEntries(conn, alloc, opts);
             }
         }.call, &options);
     } else {
@@ -246,6 +260,77 @@ fn summaryEntries(conn: *c.PGconn, allocator: std.mem.Allocator, opts: *const Op
     }
 }
 
+fn trendEntries(conn: *c.PGconn, allocator: std.mem.Allocator, opts: *const Options) !void {
+    const cohort = try getRequiredOpt(opts, "cohort");
+    const weeks = opts.get("weeks") orelse "6";
+
+    const cohort_z = try std.cstr.addNullByte(allocator, cohort);
+    const weeks_z = try std.cstr.addNullByte(allocator, weeks);
+
+    var values: [2][*c]const u8 = .{ cohort_z.ptr, weeks_z.ptr };
+    const sql =
+        "WITH ordered AS (" ++
+        "  SELECT cohort_name, week_index, attendance_count, submission_count, session_count, " ++
+        "    (attendance_count * 0.5 + submission_count * 0.35 + session_count * 0.15) AS momentum_score, " ++
+        "    LAG(attendance_count) OVER (PARTITION BY cohort_name ORDER BY week_index) AS prev_attendance, " ++
+        "    LAG(submission_count) OVER (PARTITION BY cohort_name ORDER BY week_index) AS prev_submission, " ++
+        "    LAG(session_count) OVER (PARTITION BY cohort_name ORDER BY week_index) AS prev_session, " ++
+        "    LAG(attendance_count * 0.5 + submission_count * 0.35 + session_count * 0.15) " ++
+        "      OVER (PARTITION BY cohort_name ORDER BY week_index) AS prev_momentum " ++
+        "  FROM groupscholar_cohort_momentum.momentum_entries " ++
+        "  WHERE cohort_name = $1" ++
+        ") " ++
+        "SELECT cohort_name, week_index, attendance_count, submission_count, session_count, " ++
+        "  ROUND(momentum_score::numeric, 2) AS momentum_score, " ++
+        "  (attendance_count - COALESCE(prev_attendance, attendance_count)) AS attendance_delta, " ++
+        "  (submission_count - COALESCE(prev_submission, submission_count)) AS submission_delta, " ++
+        "  (session_count - COALESCE(prev_session, session_count)) AS session_delta, " ++
+        "  ROUND((momentum_score - COALESCE(prev_momentum, momentum_score))::numeric, 2) AS momentum_delta " ++
+        "FROM ordered " ++
+        "ORDER BY week_index DESC " ++
+        "LIMIT $2;";
+
+    const result = c.PQexecParams(conn, sql, 2, null, &values, null, null, 0);
+    defer c.PQclear(result);
+    try ensureTuplesOk(conn, result);
+    try printRows(result, std.io.getStdOut().writer());
+}
+
+fn exportEntries(conn: *c.PGconn, allocator: std.mem.Allocator, opts: *const Options) !void {
+    const out_path = try getRequiredOpt(opts, "out");
+
+    var file: ?std.fs.File = null;
+    var writer = std.io.getStdOut().writer();
+    if (!std.mem.eql(u8, out_path, "-")) {
+        file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+        writer = file.?.writer();
+    }
+    defer if (file) |f| f.close();
+
+    if (opts.get("cohort")) |cohort| {
+        const cohort_z = try std.cstr.addNullByte(allocator, cohort);
+        var values: [1][*c]const u8 = .{cohort_z.ptr};
+        const sql =
+            "SELECT cohort_name, week_index, attendance_count, submission_count, session_count, notes, recorded_at " ++
+            "FROM groupscholar_cohort_momentum.momentum_entries " ++
+            "WHERE cohort_name = $1 " ++
+            "ORDER BY week_index ASC, recorded_at ASC;";
+        const result = c.PQexecParams(conn, sql, 1, null, &values, null, null, 0);
+        defer c.PQclear(result);
+        try ensureTuplesOk(conn, result);
+        try writeCsv(result, writer);
+    } else {
+        const sql =
+            "SELECT cohort_name, week_index, attendance_count, submission_count, session_count, notes, recorded_at " ++
+            "FROM groupscholar_cohort_momentum.momentum_entries " ++
+            "ORDER BY cohort_name ASC, week_index ASC, recorded_at ASC;";
+        const result = c.PQexec(conn, sql);
+        defer c.PQclear(result);
+        try ensureTuplesOk(conn, result);
+        try writeCsv(result, writer);
+    }
+}
+
 fn execFile(conn: *c.PGconn, allocator: std.mem.Allocator, path: []const u8) !void {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
@@ -299,6 +384,51 @@ fn printRows(result: *c.PGresult, writer: anytype) !void {
     }
 }
 
+fn writeCsv(result: *c.PGresult, writer: anytype) !void {
+    const cols = c.PQnfields(result);
+    var col: c_int = 0;
+    while (col < cols) : (col += 1) {
+        const name = c.PQfname(result, col);
+        try writeCsvValue(writer, std.mem.span(name));
+        if (col + 1 < cols) {
+            try writer.writeAll(",");
+        }
+    }
+    try writer.writeAll("\\n");
+
+    const rows = c.PQntuples(result);
+    var row: c_int = 0;
+    while (row < rows) : (row += 1) {
+        col = 0;
+        while (col < cols) : (col += 1) {
+            const value = c.PQgetvalue(result, row, col);
+            try writeCsvValue(writer, std.mem.span(value));
+            if (col + 1 < cols) {
+                try writer.writeAll(",");
+            }
+        }
+        try writer.writeAll("\\n");
+    }
+}
+
+fn writeCsvValue(writer: anytype, value: []const u8) !void {
+    const needs_quotes = std.mem.indexOfAny(u8, value, ",\"\n\r") != null;
+    if (!needs_quotes) {
+        try writer.writeAll(value);
+        return;
+    }
+    try writer.writeAll("\"");
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (value[i] == '"') {
+            try writer.writeAll("\"\"");
+        } else {
+            try writer.writeByte(value[i]);
+        }
+    }
+    try writer.writeAll("\"");
+}
+
 test "parseOptions handles key value pairs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -310,4 +440,11 @@ test "parseOptions handles key value pairs" {
 
     try std.testing.expectEqualStrings("Spring", opts.get("cohort").?);
     try std.testing.expectEqualStrings("3", opts.get("week").?);
+}
+
+test "writeCsvValue escapes quotes and commas" {
+    var buffer: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    try writeCsvValue(stream.writer(), "Ready, set \"go\"");
+    try std.testing.expectEqualStrings("\"Ready, set \"\"go\"\"\"", stream.getWritten());
 }
